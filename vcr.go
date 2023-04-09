@@ -40,13 +40,13 @@ type Response struct {
 
 type cassette struct {
 	Interactions []*struct {
-		Request *struct {
+		Request struct {
 			Method string `yaml:"method"`
 			URI    string `yaml:"uri"`
 			Body   *struct {
 				Encoding string `yaml:"encoding"`
 				String   string `yaml:"string"`
-			} `yaml:"body"`
+			} `yaml:"body,omitempty"`
 			Headers http.Header `yaml:"headers"`
 			Form    url.Values  `yaml:"form,omitempty"`
 		} `yaml:"request"`
@@ -84,7 +84,7 @@ func normalizeJson(input string) string {
 }
 
 // replay a VCR and check for updates
-func replay(t *testing.T, handler http.Handler, tape *cassette) {
+func replay(t *testing.T, handler http.Handler, tape *cassette, opts ...NormalizeOption) {
 	t.Helper()
 	for _, interaction := range tape.Interactions {
 		requestURI, err := url.Parse(interaction.Request.URI)
@@ -92,10 +92,15 @@ func replay(t *testing.T, handler http.Handler, tape *cassette) {
 
 		recorder := httptest.NewRecorder()
 
+		var requestBody io.ReadCloser
+		if interaction.Request.Body != nil {
+			requestBody = io.NopCloser(strings.NewReader(interaction.Request.Body.String))
+		}
+
 		request := &http.Request{
 			Method: strings.ToUpper(interaction.Request.Method),
 			URL:    requestURI,
-			Body:   io.NopCloser(strings.NewReader(interaction.Request.Body.String)),
+			Body:   requestBody,
 			Header: interaction.Request.Headers,
 		}
 
@@ -139,7 +144,7 @@ func replay(t *testing.T, handler http.Handler, tape *cassette) {
 
 		// reduce the noise in diffs by only updating the timestamp of things
 		// that have changed
-		if isResponseModified(interaction.Response, recording) {
+		if isResponseModified(interaction.Response, recording, opts...) {
 			interaction.Response = recording
 			interaction.RecordedAt = time.Now().UTC().Format(http.TimeFormat)
 		}
@@ -154,7 +159,7 @@ var uuidPattern = regexp.MustCompile(`[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[0-9a
 
 // normalizeResponse strips out anything from response that may change between runs
 // but has no effect on the equality of a response
-func normalizeResponse(response *Response) *Response {
+func normalizeResponse(response *Response, opts ...NormalizeOption) *Response {
 	if response == nil {
 		return nil
 	}
@@ -164,27 +169,27 @@ func normalizeResponse(response *Response) *Response {
 
 	body := response.Body.String
 
-	// rewrite all the timestamps to be the same
-	body = timestampPattern.ReplaceAllLiteralString(body, "0001-01-01T00:00:00Z")
-	// Rewrite v4 UUIDs to a known value. To keep the value of the GUID intact use a non v4 UUID.
-	body = uuidPattern.ReplaceAllLiteralString(body, "11111111-2222-3333-4444-000000000000")
-
 	response.Body.String = body
 
-	if response.Headers != nil {
-		clone.Headers = response.Headers.Clone()
-		clone.Headers.Set("Content-Length", "0")
+	clone.Headers = response.Headers.Clone()
+
+	if clone.Headers == nil {
+		clone.Headers = http.Header{}
+	}
+
+	for _, opt := range opts {
+		opt(clone)
 	}
 
 	return clone
 }
 
-func isResponseModified(before *Response, after *Response) bool {
-	return !reflect.DeepEqual(normalizeResponse(before), normalizeResponse(after))
+func isResponseModified(before *Response, after *Response, opts ...NormalizeOption) bool {
+	return !reflect.DeepEqual(normalizeResponse(before, opts...), normalizeResponse(after, opts...))
 }
 
 // overwriteTape loads the cassette at name and then replaces it after any modifications have been performed by fn
-func overwriteTape(t *testing.T, path string, handler http.Handler) {
+func overwriteTape(t *testing.T, path string, handler http.Handler, opts ...NormalizeOption) {
 	t.Helper()
 
 	fd, err := os.Open(path)
@@ -210,7 +215,7 @@ func overwriteTape(t *testing.T, path string, handler http.Handler) {
 	tape, err := Open(fd)
 	require.NoError(t, err)
 
-	replay(t, handler, tape)
+	replay(t, handler, tape, opts...)
 
 	err = tape.Encode(tmp)
 	require.NoError(t, err)
@@ -222,7 +227,7 @@ func overwriteTape(t *testing.T, path string, handler http.Handler) {
 }
 
 // diffTape loads the tape and returns an error if it was modified by fn
-func diffTape(t *testing.T, path string, handler http.Handler) {
+func diffTape(t *testing.T, path string, handler http.Handler, opts ...NormalizeOption) {
 	t.Helper()
 	fd, err := os.Open(path)
 	require.NoError(t, err)
@@ -241,7 +246,7 @@ func diffTape(t *testing.T, path string, handler http.Handler) {
 	err = tape.Encode(&before)
 	require.NoError(t, err)
 
-	replay(t, handler, tape)
+	replay(t, handler, tape, opts...)
 
 	err = tape.Encode(&after)
 	require.NoError(t, err)
@@ -251,7 +256,18 @@ func diffTape(t *testing.T, path string, handler http.Handler) {
 
 var overwrite = flag.Bool("overwrite", false, "Overwrite existing cassettes")
 
-func Replay(t *testing.T, name string, handler http.Handler) {
+func defaultNormalizer(resp *Response) {
+	// rewrite all the timestamps to be the same
+	resp.Body.String = timestampPattern.ReplaceAllLiteralString(resp.Body.String, "0001-01-01T00:00:00Z")
+	// Rewrite v4 UUIDs to a known value. To keep the value of the GUID intact use a non v4 UUID.
+	resp.Body.String = uuidPattern.ReplaceAllLiteralString(resp.Body.String, "11111111-2222-3333-4444-000000000000")
+	// ignore incorrect content lengths
+	resp.Headers.Set("Content-Length", "0")
+}
+
+type NormalizeOption func(*Response)
+
+func Replay(t *testing.T, name string, handler http.Handler, opts ...NormalizeOption) {
 	t.Helper()
 
 	fn := diffTape
@@ -260,5 +276,9 @@ func Replay(t *testing.T, name string, handler http.Handler) {
 		fn = overwriteTape
 	}
 
-	fn(t, name, handler)
+	if len(opts) == 0 {
+		opts = []NormalizeOption{defaultNormalizer}
+	}
+
+	fn(t, name, handler, opts...)
 }
